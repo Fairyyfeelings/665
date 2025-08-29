@@ -1,5 +1,6 @@
 """
 665 — Avrae-style TTRPG Discord Bot (discord.py + asyncpg Postgres)
+Adds multi-NPC sheets and 'roll by name'.
 
 ENV (Render -> your service -> Environment):
 - DISCORD_TOKEN = <your Discord bot token>
@@ -14,7 +15,7 @@ Build command:          pip install -r requirements.txt
 from flask import Flask
 from threading import Thread
 import os, random
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Literal
 
 app = Flask(__name__)
 
@@ -61,7 +62,7 @@ def clamp(n: int, lo: int, hi: int) -> int:
 
 # ------------------------------- SQL schema ----------------------------------
 CREATE_SQL = [
-    # players
+    # ---- PCs (existing tables; unchanged) ----
     """
     CREATE TABLE IF NOT EXISTS players (
         guild_id BIGINT,
@@ -82,7 +83,6 @@ CREATE_SQL = [
         PRIMARY KEY (guild_id, user_id)
     );
     """,
-    # skills (base points)
     """
     CREATE TABLE IF NOT EXISTS skills (
         guild_id BIGINT,
@@ -92,7 +92,6 @@ CREATE_SQL = [
         PRIMARY KEY (guild_id, user_id, skill)
     );
     """,
-    # extra bonuses that stack
     """
     CREATE TABLE IF NOT EXISTS bonuses (
         id BIGSERIAL PRIMARY KEY,
@@ -103,7 +102,6 @@ CREATE_SQL = [
         reason TEXT
     );
     """,
-    # inventory
     """
     CREATE TABLE IF NOT EXISTS inventory (
         guild_id BIGINT,
@@ -113,7 +111,6 @@ CREATE_SQL = [
         PRIMARY KEY (guild_id, user_id, item)
     );
     """,
-    # weaknesses
     """
     CREATE TABLE IF NOT EXISTS weaknesses (
         id BIGSERIAL PRIMARY KEY,
@@ -122,7 +119,6 @@ CREATE_SQL = [
         text TEXT
     );
     """,
-    # lineage ability usage (per scene/rest)
     """
     CREATE TABLE IF NOT EXISTS ability_usage (
         guild_id BIGINT,
@@ -131,6 +127,47 @@ CREATE_SQL = [
         scope TEXT,  -- 'scene' or 'rest'
         used BOOLEAN DEFAULT FALSE,
         PRIMARY KEY (guild_id, user_id, ability)
+    );
+    """,
+
+    # ---- NPCs (new) ----
+    """
+    CREATE TABLE IF NOT EXISTS npc_chars (
+        id BIGSERIAL PRIMARY KEY,
+        guild_id BIGINT,
+        owner_id BIGINT,      -- GM who created/controls this NPC
+        name TEXT,
+        quote TEXT,
+        lineage TEXT,
+        hp INTEGER DEFAULT 10,
+        max_hp INTEGER DEFAULT 10,
+        rv INTEGER DEFAULT 5,
+        max_rv INTEGER DEFAULT 5,
+        favors INTEGER DEFAULT 0,
+        connections INTEGER DEFAULT 0,
+        home TEXT,
+        transport TEXT,
+        wealth TEXT,
+        UNIQUE (guild_id, owner_id, name)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS npc_skills (
+        npc_id BIGINT,
+        skill TEXT,
+        points INTEGER,
+        PRIMARY KEY (npc_id, skill),
+        FOREIGN KEY (npc_id) REFERENCES npc_chars(id) ON DELETE CASCADE
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS npc_bonuses (
+        id BIGSERIAL PRIMARY KEY,
+        npc_id BIGINT,
+        skill TEXT,
+        bonus INTEGER,
+        reason TEXT,
+        FOREIGN KEY (npc_id) REFERENCES npc_chars(id) ON DELETE CASCADE
     );
     """,
 ]
@@ -163,7 +200,6 @@ class TTRPGBot(commands.Bot):
         self.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
         await init_db(self.pool)
 
-        # Fast guild sync if GUILD_ID provided
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -178,7 +214,7 @@ bot = TTRPGBot()
 @bot.event
 async def on_ready():
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.playing, name="/sheet • /roll • !r")
+        activity=discord.Activity(type=discord.ActivityType.playing, name="/sheet • /roll • !r • /npc_create")
     )
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
@@ -202,7 +238,7 @@ async def ensure_player(gid: int, uid: int, name: str = "Player", lineage: Optio
                 gid, uid, sk
             )
 
-async def get_skill_total(gid: int, uid: int, skill: str) -> Tuple[int, int, int]:
+async def get_skill_total_pc(gid: int, uid: int, skill: str) -> Tuple[int, int, int]:
     s = slug(skill)
     p = pool()
     async with p.acquire() as con:
@@ -215,11 +251,53 @@ async def get_skill_total(gid: int, uid: int, skill: str) -> Tuple[int, int, int
         ) or 0)
     return base, bonus, base + bonus
 
-def is_gm(member: discord.Member) -> bool:
-    p = member.guild_permissions
-    return p.administrator or p.manage_guild
+# ---- NPC helpers ----
+async def npc_get(gid: int, owner_id: int, name: str):
+    p = pool()
+    async with p.acquire() as con:
+        return await con.fetchrow("SELECT * FROM npc_chars WHERE guild_id=$1 AND owner_id=$2 AND name=$3",
+                                  gid, owner_id, name)
 
-# --------------------------- Character Creation (fixed) -----------------------
+async def npc_ensure_skills(npc_id: int):
+    p = pool()
+    async with p.acquire() as con:
+        for sk in SKILLS:
+            await con.execute(
+                "INSERT INTO npc_skills (npc_id,skill,points) VALUES ($1,$2,0) ON CONFLICT DO NOTHING",
+                npc_id, sk
+            )
+
+async def npc_skill_total(npc_id: int, skill: str) -> Tuple[int,int,int]:
+    s = slug(skill)
+    p = pool()
+    async with p.acquire() as con:
+        base = int(await con.fetchval("SELECT points FROM npc_skills WHERE npc_id=$1 AND skill=$2", npc_id, s) or 0)
+        bonus = int(await con.fetchval("SELECT COALESCE(SUM(bonus),0) FROM npc_bonuses WHERE npc_id=$1 AND skill=$2",
+                                       npc_id, s) or 0)
+    return base, bonus, base + bonus
+
+# A generic "actor" fetch used by rolling/sheet APIs
+ActorKind = Literal["pc","npc"]
+class Actor:
+    def __init__(self, kind: ActorKind, gid: int, uid: int, name: Optional[str] = None, npc_id: Optional[int] = None):
+        self.kind = kind
+        self.gid = gid
+        self.uid = uid
+        self.name = name
+        self.npc_id = npc_id
+
+async def resolve_actor_for_roll(gid: int, uid: int, as_name: Optional[str]) -> Actor:
+    """
+    If as_name is provided, try NPC (owned by uid). Otherwise, PC.
+    """
+    if as_name:
+        npc = await npc_get(gid, uid, as_name)
+        if npc:
+            return Actor("npc", gid, uid, name=npc["name"], npc_id=int(npc["id"]))
+    # default to PC
+    return Actor("pc", gid, uid)
+
+# --------------------------- Character Creation (PC) -------------------------
 @bot.tree.command(description="Create your character with lineage and skill distribution")
 @app_commands.describe(
     name="Character name",
@@ -261,7 +339,6 @@ async def create(
     gid = interaction.guild_id
     uid = interaction.user.id
 
-    # Validate the 5 distinct skill picks
     picks = [x.value for x in [plus3, plus2_a, plus2_b, plus1_a, plus1_b] if x]
     if len(picks) != 5 or len(set(picks)) != 5:
         return await interaction.response.send_message(
@@ -272,7 +349,7 @@ async def create(
     await ensure_player(gid, uid, name=name, lineage=lineage.value)
     p = pool()
     async with p.acquire() as con:
-        # 1) Hard reset to BASELINE so old lineage perks don’t stick
+        # Reset to baseline
         await con.execute("""
             UPDATE players
             SET hp=10, max_hp=10, rv=5, max_rv=5, favors=1, connections=0
@@ -280,68 +357,53 @@ async def create(
         """, gid, uid)
         await con.execute("DELETE FROM ability_usage WHERE guild_id=$1 AND user_id=$2", gid, uid)
 
-        # 2) Reset skills then apply the chosen distribution
+        # Reset skills then apply distribution
         await con.execute("UPDATE skills SET points=0 WHERE guild_id=$1 AND user_id=$2", gid, uid)
-        await con.execute(
-            "UPDATE skills SET points=3 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, plus3.value
-        )
+        await con.execute("UPDATE skills SET points=3 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, plus3.value)
         for s in [plus2_a.value, plus2_b.value]:
             await con.execute("UPDATE skills SET points=2 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, s)
         for s in [plus1_a.value, plus1_b.value]:
             await con.execute("UPDATE skills SET points=1 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, s)
 
-        # 3) Apply lineage-specific perks
+        # lineage effects
         start_text = "HP 10, RV 5, Favors 1"
-
         if lineage.value == "whitelighter":
-            # +2 RV (both current & max), and track orbing/healing usage
             await con.execute("UPDATE players SET rv=rv+2, max_rv=max_rv+2 WHERE guild_id=$1 AND user_id=$2", gid, uid)
             await con.execute(
-                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'orbing','scene',FALSE) "
-                "ON CONFLICT DO NOTHING",
+                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'orbing','scene',FALSE)"
+                " ON CONFLICT DO NOTHING",
                 gid, uid
             )
             await con.execute(
-                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'healing','rest',FALSE) "
-                "ON CONFLICT DO NOTHING",
+                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'healing','rest',FALSE)"
+                " ON CONFLICT DO NOTHING",
                 gid, uid
             )
             start_text += " (+2 RV from Whitelighter)"
-
         elif lineage.value == "human":
-            # +3 connections, and +1 to ANY ONE of the chosen skills (cap 5)
             await con.execute("UPDATE players SET connections=connections+3 WHERE guild_id=$1 AND user_id=$2", gid, uid)
-            applied = None
             if human_bonus_skill and human_bonus_skill.value in picked_set:
                 await con.execute(
                     "UPDATE skills SET points=LEAST(points+1,5) WHERE guild_id=$1 AND user_id=$2 AND skill=$3",
                     gid, uid, human_bonus_skill.value
                 )
-                applied = human_bonus_skill.value
-                start_text += f" (+3 connections; +1 to {applied.title()})"
+                start_text += f" (+3 connections; +1 to {human_bonus_skill.value.title()})"
             else:
                 start_text += " (+3 connections)"
-
         elif lineage.value == "witch":
-            # +2 to ANY ONE of the chosen skills (cap 5)
-            applied = None
             if witch_bonus_skill and witch_bonus_skill.value in picked_set:
                 await con.execute(
                     "UPDATE skills SET points=LEAST(points+2,5) WHERE guild_id=$1 AND user_id=$2 AND skill=$3",
                     gid, uid, witch_bonus_skill.value
                 )
-                applied = witch_bonus_skill.value
-                start_text += f" (+2 to {applied.title()})"
+                start_text += f" (+2 to {witch_bonus_skill.value.title()})"
+        # demon: glamour is narrative
 
-        # Demon: Glamour is RP utility (no numeric change here)
-
-        # 4) Save top-level character fields
         await con.execute(
             "UPDATE players SET name=$1, quote=$2, lineage=$3 WHERE guild_id=$4 AND user_id=$5",
             name, quote, lineage.value, gid, uid
         )
 
-    # 5) Friendly confirmation embed
     embed = discord.Embed(title=f"{name} created!", color=discord.Color.magenta())
     embed.add_field(name="Lineage", value=lineage.name)
     if quote:
@@ -349,7 +411,6 @@ async def create(
     embed.add_field(name="Starts with", value=start_text, inline=False)
     embed.set_footer(text="Use /sheet to view, /roll or !r to play.")
     await interaction.response.send_message(embed=embed)
-
 
 # ------------------------------- Career (Human) -------------------------------
 @bot.tree.command(description="(Human) Set your Career: Home, Transportation, Wealth (+ optional gear note)")
@@ -389,12 +450,37 @@ async def career_set(
     await interaction.response.send_message("Career saved.")
 
 # -------------------------------- Character Sheet ----------------------------
-@bot.tree.command(description="Show your character sheet")
-async def sheet(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+@bot.tree.command(description="Show your character sheet (PC or NPC by name)")
+async def sheet(interaction: discord.Interaction, member: Optional[discord.Member] = None, name: Optional[str] = None):
+    """
+    /sheet                 -> your PC sheet (ephemeral)
+    /sheet member:@user    -> that user's PC sheet
+    /sheet name:"Bob"      -> your NPC named Bob (owned by you)
+    """
     if interaction.guild_id is None:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    target = member or interaction.user
+
     gid = interaction.guild_id
+    p = pool()
+    if name:
+        # NPC owned by the caller
+        npc = await npc_get(gid, interaction.user.id, name)
+        if not npc:
+            return await interaction.response.send_message("No such NPC (owned by you).", ephemeral=True)
+        async with p.acquire() as con:
+            sk = await con.fetch("SELECT skill, points FROM npc_skills WHERE npc_id=$1 ORDER BY skill", npc["id"])
+        skills_text = ", ".join([f"{r['skill']} +{r['points']}" for r in sk if r["points"]]) or "(no skills set)"
+        embed = discord.Embed(title=f"{npc['name']} — NPC ({npc['lineage'] or 'unknown'})", color=discord.Color.gold())
+        if npc["quote"]:
+            embed.description = f"“{npc['quote']}”"
+        embed.add_field(name="❤️ HP", value=f"{npc['hp']} / {npc['max_hp']}")
+        embed.add_field(name="🔘 RV", value=f"{npc['rv']} / {npc['max_rv']}")
+        embed.add_field(name="Skills", value=skills_text, inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # otherwise PC flow
+    target = member or interaction.user
     uid = target.id
     p = pool()
     async with p.acquire() as con:
@@ -431,15 +517,213 @@ async def sheet(interaction: discord.Interaction, member: Optional[discord.Membe
     embed.add_field(name="Inventory", value=inv_text, inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+# --------------------------------- NPC CRUD ----------------------------------
+@bot.tree.command(description="[GM] Create an NPC with lineage and skills (same flow as /create)")
+@app_commands.describe(
+    name="NPC name",
+    lineage="Lineage",
+    quote="Optional quote",
+    plus3="Skill at +3",
+    plus2_a="First +2 skill",
+    plus2_b="Second +2 skill",
+    plus1_a="First +1 skill",
+    plus1_b="Second +1 skill",
+    human_bonus_skill="(HUMAN) +1 to any one of the chosen skills",
+    witch_bonus_skill="(WITCH) +2 to any one of the chosen skills",
+)
+@app_commands.choices(
+    lineage=[app_commands.Choice(name=x.capitalize(), value=x) for x in LINEAGES],
+    plus3=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    plus2_a=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    plus2_b=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    plus1_a=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    plus1_b=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    human_bonus_skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    witch_bonus_skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+)
+async def npc_create(
+    interaction: discord.Interaction,
+    name: str,
+    lineage: app_commands.Choice[str],
+    quote: Optional[str] = None,
+    plus3: Optional[app_commands.Choice[str]] = None,
+    plus2_a: Optional[app_commands.Choice[str]] = None,
+    plus2_b: Optional[app_commands.Choice[str]] = None,
+    plus1_a: Optional[app_commands.Choice[str]] = None,
+    plus1_b: Optional[app_commands.Choice[str]] = None,
+    human_bonus_skill: Optional[app_commands.Choice[str]] = None,
+    witch_bonus_skill: Optional[app_commands.Choice[str]] = None,
+):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    picks = [x.value for x in [plus3, plus2_a, plus2_b, plus1_a, plus1_b] if x]
+    if len(picks) != 5 or len(set(picks)) != 5:
+        return await interaction.response.send_message("Pick five different skills: +3, +2, +2, +1, +1.", ephemeral=True)
+    picked_set = set(picks)
+
+    p = pool()
+    async with p.acquire() as con:
+        # Upsert (replace if exists)
+        existing = await con.fetchrow("SELECT id FROM npc_chars WHERE guild_id=$1 AND owner_id=$2 AND name=$3",
+                                      gid, owner, name)
+        if existing:
+            npc_id = int(existing["id"])
+            await con.execute("DELETE FROM npc_bonuses WHERE npc_id=$1", npc_id)
+            await con.execute("DELETE FROM npc_skills WHERE npc_id=$1", npc_id)
+            await con.execute("""
+                UPDATE npc_chars SET quote=$1, lineage=$2, hp=10, max_hp=10, rv=5, max_rv=5, favors=0, connections=0
+                WHERE id=$3
+            """, quote, lineage.value, npc_id)
+        else:
+            row = await con.fetchrow(
+                "INSERT INTO npc_chars (guild_id,owner_id,name,quote,lineage) VALUES ($1,$2,$3,$4,$5) RETURNING id",
+                gid, owner, name, quote, lineage.value
+            )
+            npc_id = int(row["id"])
+
+        await npc_ensure_skills(npc_id)
+        # Base distribution
+        await con.execute("UPDATE npc_skills SET points=0 WHERE npc_id=$1", npc_id)
+        await con.execute("UPDATE npc_skills SET points=3 WHERE npc_id=$1 AND skill=$2", npc_id, plus3.value)
+        for s in [plus2_a.value, plus2_b.value]:
+            await con.execute("UPDATE npc_skills SET points=2 WHERE npc_id=$1 AND skill=$2", npc_id, s)
+        for s in [plus1_a.value, plus1_b.value]:
+            await con.execute("UPDATE npc_skills SET points=1 WHERE npc_id=$1 AND skill=$2", npc_id, s)
+
+        start_text = "HP 10, RV 5"
+        # Lineage effects
+        if lineage.value == "whitelighter":
+            await con.execute("UPDATE npc_chars SET rv=rv+2, max_rv=max_rv+2 WHERE id=$1", npc_id)
+            start_text += " (+2 RV from Whitelighter)"
+        elif lineage.value == "human":
+            await con.execute("UPDATE npc_chars SET connections=connections+3 WHERE id=$1", npc_id)
+            if human_bonus_skill and human_bonus_skill.value in picked_set:
+                await con.execute("UPDATE npc_skills SET points=LEAST(points+1,5) WHERE npc_id=$1 AND skill=$2",
+                                  npc_id, human_bonus_skill.value)
+                start_text += f" (+3 connections; +1 to {human_bonus_skill.value.title()})"
+            else:
+                start_text += " (+3 connections)"
+        elif lineage.value == "witch":
+            if witch_bonus_skill and witch_bonus_skill.value in picked_set:
+                await con.execute("UPDATE npc_skills SET points=LEAST(points+2,5) WHERE npc_id=$1 AND skill=$2",
+                                  npc_id, witch_bonus_skill.value)
+                start_text += f" (+2 to {witch_bonus_skill.value.title()})"
+        # demon: glamour narrative only
+
+    embed = discord.Embed(title=f"NPC '{name}' saved", color=discord.Color.gold())
+    if quote:
+        embed.add_field(name="Quote", value=f"“{quote}”", inline=False)
+    embed.add_field(name="Lineage", value=lineage.name)
+    embed.add_field(name="Starts with", value=start_text, inline=False)
+    embed.set_footer(text="Use /npc_sheet name:<name> • roll with /roll as_name:<name> or !r ... as <name>")
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(description="[GM] List your NPCs")
+async def npc_list(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    p = pool()
+    async with p.acquire() as con:
+        rows = await con.fetch("SELECT name, lineage FROM npc_chars WHERE guild_id=$1 AND owner_id=$2 ORDER BY name", gid, owner)
+    if not rows:
+        return await interaction.response.send_message("(no NPCs yet)", ephemeral=True)
+    text = "\n".join([f"• {r['name']} — {r['lineage']}" for r in rows])
+    await interaction.response.send_message(text, ephemeral=True)
+
+@bot.tree.command(description="[GM] Show an NPC sheet you own")
+async def npc_sheet(interaction: discord.Interaction, name: str):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    npc = await npc_get(gid, owner, name)
+    if not npc:
+        return await interaction.response.send_message("No such NPC.", ephemeral=True)
+    p = pool()
+    async with p.acquire() as con:
+        sk = await con.fetch("SELECT skill, points FROM npc_skills WHERE npc_id=$1 ORDER BY skill", npc["id"])
+    skills_text = ", ".join([f"{r['skill']} +{r['points']}" for r in sk if r["points"]]) or "(no skills set)"
+    embed = discord.Embed(title=f"{npc['name']} — NPC ({npc['lineage'] or 'unknown'})", color=discord.Color.gold())
+    if npc["quote"]:
+        embed.description = f"“{npc['quote']}”"
+    embed.add_field(name="❤️ HP", value=f"{npc['hp']} / {npc['max_hp']}")
+    embed.add_field(name="🔘 RV", value=f"{npc['rv']} / {npc['max_rv']}")
+    embed.add_field(name="Skills", value=skills_text, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(description="[GM] Delete an NPC you own")
+async def npc_delete(interaction: discord.Interaction, name: str):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    p = pool()
+    async with p.acquire() as con:
+        row = await con.fetchrow("DELETE FROM npc_chars WHERE guild_id=$1 AND owner_id=$2 AND name=$3 RETURNING id",
+                                 gid, owner, name)
+    if row:
+        return await interaction.response.send_message(f"Deleted NPC '{name}'.", ephemeral=True)
+    return await interaction.response.send_message("No such NPC.", ephemeral=True)
+
+@bot.tree.command(description="[GM] Damage/heal an NPC's HP (positive damages; negative heals)")
+async def npc_hp(interaction: discord.Interaction, name: str, amount: int):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    npc = await npc_get(gid, owner, name)
+    if not npc:
+        return await interaction.response.send_message("No such NPC.", ephemeral=True)
+    cur, mx = int(npc["hp"]), int(npc["max_hp"])
+    newv = clamp(cur - amount if amount > 0 else cur + (-amount), 0, mx)
+    p = pool()
+    async with p.acquire() as con:
+        await con.execute("UPDATE npc_chars SET hp=$1 WHERE id=$2", newv, npc["id"])
+    await interaction.response.send_message(f"{name} HP now **{newv}**/{mx}.", ephemeral=True)
+
+@bot.tree.command(description="[GM] Spend/restore an NPC's RV (positive spends; negative restores)")
+async def npc_rv(interaction: discord.Interaction, name: str, amount: int):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
+        return await interaction.response.send_message("GM only.", ephemeral=True)
+    gid = interaction.guild_id
+    owner = interaction.user.id
+    npc = await npc_get(gid, owner, name)
+    if not npc:
+        return await interaction.response.send_message("No such NPC.", ephemeral=True)
+    cur, mx = int(npc["rv"]), int(npc["max_rv"])
+    newv = clamp(cur - amount if amount > 0 else cur + (-amount), 0, mx)
+    p = pool()
+    async with p.acquire() as con:
+        await con.execute("UPDATE npc_chars SET rv=$1 WHERE id=$2", newv, npc["id"])
+    await interaction.response.send_message(f"{name} RV now **{newv}**/{mx}.", ephemeral=True)
+
 # ----------------------------------- Rolls -----------------------------------
-@bot.tree.command(description="Roll 1d20 + skill (+ bonuses). Supports advantage/disadvantage and DC.")
+@bot.tree.command(description="Roll 1d20 + skill (+ bonuses). Supports advantage/disadvantage, DC, and 'as_name' for NPC.")
 @app_commands.describe(
     skill="Which skill",
     advantage="Roll 2d20 take higher",
     disadvantage="Roll 2d20 take lower",
     dc="Optional difficulty to compare",
     bonus="Extra situational modifier",
-    note="Footer note"
+    note="Footer note",
+    as_name="Roll as your NPC with this name (owned by you)"
 )
 @app_commands.choices(skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS])
 async def roll(
@@ -450,6 +734,7 @@ async def roll(
     dc: Optional[int] = None,
     bonus: Optional[int] = 0,
     note: Optional[str] = None,
+    as_name: Optional[str] = None,
 ):
     if advantage and disadvantage:
         return await interaction.response.send_message("Can't have both advantage and disadvantage.", ephemeral=True)
@@ -458,9 +743,15 @@ async def roll(
 
     gid = interaction.guild_id
     uid = interaction.user.id
-    await ensure_player(gid, uid, interaction.user.display_name)
+    actor = await resolve_actor_for_roll(gid, uid, as_name)
 
-    base, extra, total_skill = await get_skill_total(gid, uid, skill.value)
+    if actor.kind == "pc":
+        await ensure_player(gid, uid, interaction.user.display_name)
+        base, extra, total_skill = await get_skill_total_pc(gid, uid, skill.value)
+        who = interaction.user.display_name
+    else:
+        base, extra, total_skill = await npc_skill_total(actor.npc_id, skill.value)
+        who = f"{as_name} (NPC)"
 
     d1, d2 = random.randint(1, 20), random.randint(1, 20)
     d20 = max(d1, d2) if advantage else (min(d1, d2) if disadvantage else d1)
@@ -468,7 +759,7 @@ async def roll(
 
     total = d20 + total_skill + int(bonus or 0)
 
-    title = f"{interaction.user.display_name} rolls {skill.name}"
+    title = f"{who} rolls {skill.name}"
     embed = discord.Embed(title=title, color=discord.Color.blurple())
     nat = " (CRIT!)" if d20 == 20 else (" (BOTCH)" if d20 == 1 else "")
     embed.add_field(name="d20", value=f"{d20}{nat}")
@@ -493,34 +784,152 @@ async def roll(
 
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(description="Opposed roll (you vs enemy bonus)")
-@app_commands.describe(skill="Your skill", enemy_bonus="Enemy flat bonus")
-@app_commands.choices(skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS])
-async def oppose(interaction: discord.Interaction, skill: app_commands.Choice[str], enemy_bonus: int):
-    if interaction.guild_id is None:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    gid = interaction.guild_id
-    uid = interaction.user.id
-    await ensure_player(gid, uid, interaction.user.display_name)
+# ---------------------------- Avrae-style !r command -------------------------
+def _pick_skill_token(tokens: List[str]) -> Optional[str]:
+    low = [t.lower() for t in tokens]
+    for s in SKILLS:
+        if s in low:
+            return s
+    for s in SKILLS:
+        for t in low:
+            if len(t) >= 3 and s.startswith(t):
+                return s
+    return None
 
-    _, _, my_bonus = await get_skill_total(gid, uid, skill.value)
-    my_d = random.randint(1, 20)
-    enemy_d = random.randint(1, 20)
-    my_total = my_d + my_bonus
-    enemy_total = enemy_d + enemy_bonus
+@bot.command(name="r", aliases=["roll"])
+async def r_prefix(ctx: commands.Context, *, text: str = ""):
+    """
+    Avrae-style:
+      !r 1d20 streetwise
+      !r 1d20 adv
+      !r 1d20 stealth dis vs 16 slipping past guards
+      !r 1d20 vs 13
+      !r 1d20 streetwise as Bob       (roll as your NPC named Bob)
+    """
+    if ctx.guild is None:
+        return await ctx.reply("Use this in a server.")
 
-    embed = discord.Embed(title="Opposed Roll", color=discord.Color.orange())
-    embed.add_field(name="You", value=f"d20={my_d} • bonus=+{my_bonus} → **{EMOJI_STAR}{my_total}{EMOJI_STAR}**")
-    embed.add_field(name="Enemy", value=f"d20={enemy_d} • bonus=+{enemy_bonus} → **{EMOJI_STAR}{enemy_total}{EMOJI_STAR}**")
-    if my_total > enemy_total:
-        embed.add_field(name="Result", value="You win.", inline=False)
-    elif my_total < enemy_total:
-        embed.add_field(name="Result", value="Enemy wins.", inline=False)
+    tokens = text.split()
+    if not tokens:
+        return await ctx.reply("Try: `!r 1d20 stealth` or `!r 1d20 dis vs 15`")
+
+    # dice
+    d_expr = tokens[0].lower()
+    if "d" not in d_expr:
+        return await ctx.reply("First token should be a dice expression like `1d20`.")
+    try:
+        dice_n, dice_sides = d_expr.split("d", 1)
+        dice_n = int(dice_n or "1")
+        dice_sides = int(dice_sides)
+    except Exception:
+        return await ctx.reply("Couldn’t parse dice. Use `1d20`.")
+    tokens = tokens[1:]
+
+    # adv/dis
+    advantage = any(t.lower() in ("adv", "advantage") for t in tokens)
+    disadvantage = any(t.lower() in ("dis", "disadvantage") for t in tokens)
+    if advantage and disadvantage:
+        return await ctx.reply("Can't have both advantage and disadvantage.")
+
+    # DC: "vs 15" or "dc 15"
+    dc = None
+    i = 0
+    while i < len(tokens)-1:
+        t = tokens[i].lower()
+        if t in ("vs", "dc"):
+            try:
+                dc = int(tokens[i+1])
+                del tokens[i:i+2]
+                continue
+            except Exception:
+                pass
+        i += 1
+
+    # 'as NAME' (NPC name) — single token name; use underscores for multiword
+    as_name = None
+    if "as" in [t.lower() for t in tokens]:
+        for i, t in enumerate(list(tokens)):
+            if t.lower() == "as" and i+1 < len(tokens):
+                as_name = tokens[i+1]
+                del tokens[i:i+2]
+                break
+
+    # skill: find one (supports partials)
+    skill = _pick_skill_token(tokens)
+    if skill:
+        for i, tok in enumerate(list(tokens)):
+            if tok.lower() == skill or (len(tok) >= 3 and skill.startswith(tok.lower())):
+                tokens.pop(i)
+                break
+
+    note = " ".join(tokens).strip() or None
+
+    gid = ctx.guild.id
+    uid = ctx.author.id
+    actor = await resolve_actor_for_roll(gid, uid, as_name)
+
+    if actor.kind == "pc":
+        await ensure_player(gid, uid, ctx.author.display_name)
+        base = extra = total_skill = 0
+        who = ctx.author.display_name
+        if skill:
+            base, extra, total_skill = await get_skill_total_pc(gid, uid, skill)
     else:
-        embed.add_field(name="Result", value="Tie (GM/defender decides).", inline=False)
-    await interaction.response.send_message(embed=embed)
+        base = extra = total_skill = 0
+        who = f"{actor.name} (NPC)"
+        if skill:
+            base, extra, total_skill = await npc_skill_total(actor.npc_id, skill)
 
-# ---------------------------- HP / RV / Favors -------------------------------
+    # roll
+    if dice_n < 1 or dice_sides < 1:
+        return await ctx.reply("Dice must be positive.")
+    if dice_sides == 20 and dice_n == 1 and (advantage or disadvantage):
+        d1, d2 = random.randint(1, 20), random.randint(1, 20)
+        d20 = max(d1, d2) if advantage else min(d1, d2)
+        advtxt = f"Advantage ({d1}/{d2})" if advantage else f"Disadvantage ({d1}/{d2})"
+        dice_total = d20
+    else:
+        rolls = [random.randint(1, dice_sides) for _ in range(min(dice_n, 50))]
+        dice_total = sum(rolls)
+        advtxt = None
+
+    total = dice_total + total_skill
+
+    title = f"{who} rolls {d_expr}"
+    if skill:
+        title += f" • {skill.title()}"
+
+    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    if dice_sides == 20 and dice_n == 1:
+        nat = " (CRIT!)" if dice_total == 20 else (" (BOTCH)" if dice_total == 1 else "")
+        embed.add_field(name="d20", value=f"{dice_total}{nat}")
+    else:
+        embed.add_field(name="Dice", value=str(dice_total))
+    if skill:
+        embed.add_field(name="Skill base", value=f"+{base}")
+        if extra:
+            embed.add_field(name="Bonuses", value=f"+{extra}")
+    embed.add_field(name="Total", value=f"**{EMOJI_STAR}{total}{EMOJI_STAR}**", inline=False)
+
+    if dc is not None:
+        outcome = "✅ Success" if (dice_total == 20 or total >= dc) else "❌ Failure"
+        if dice_sides == 20 and dice_n == 1 and dice_total == 1:
+            outcome = "❌ **Nat 1** (Complication)"
+        elif dice_sides == 20 and dice_n == 1 and dice_total == 20:
+            outcome = "✅ **Nat 20** (Automatic)"
+        embed.add_field(name=f"vs DC {dc}", value=outcome, inline=False)
+
+    footer_parts = []
+    if advtxt:
+        footer_parts.append(advtxt)
+    if note:
+        footer_parts.append(note)
+    if footer_parts:
+        embed.set_footer(text=" • ".join(footer_parts))
+
+    await ctx.reply(embed=embed)
+
+# ---------------------------- HP / RV / Favors (PC) --------------------------
 @bot.tree.command(description="Damage or heal HP (positive damages, negative heals)")
 async def hp(interaction: discord.Interaction, amount: int):
     if interaction.guild_id is None:
@@ -562,7 +971,7 @@ async def favor(interaction: discord.Interaction, spend: Optional[bool] = None, 
     uid = interaction.user.id
     p = pool()
     if reset:
-        if not isinstance(interaction.user, discord.Member) or not is_gm(interaction.user):
+        if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
             return await interaction.response.send_message("GM only.", ephemeral=True)
         async with p.acquire() as con:
             await con.execute("UPDATE players SET favors=1 WHERE guild_id=$1", gid)
@@ -579,52 +988,7 @@ async def favor(interaction: discord.Interaction, spend: Optional[bool] = None, 
             fav = int(await con.fetchval("SELECT favors FROM players WHERE guild_id=$1 AND user_id=$2", gid, uid) or 0)
         return await interaction.response.send_message(f"You have **{fav}** Favor(s).", ephemeral=True)
 
-# -------------------------------- Inventory ----------------------------------
-@bot.tree.command(description="Add item to your inventory")
-async def inv_add(interaction: discord.Interaction, item: str, qty: Optional[int] = 1):
-    if interaction.guild_id is None:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    gid = interaction.guild_id
-    uid = interaction.user.id
-    qty = max(1, qty or 1)
-    p = pool()
-    async with p.acquire() as con:
-        await con.execute(
-            "INSERT INTO inventory (guild_id,user_id,item,qty) VALUES ($1,$2,$3,$4) "
-            "ON CONFLICT (guild_id,user_id,item) DO UPDATE SET qty = inventory.qty + EXCLUDED.qty",
-            gid, uid, item, qty
-        )
-    await interaction.response.send_message(f"Added {qty}× {item}.")
-
-@bot.tree.command(description="Remove item(s) from inventory")
-async def inv_remove(interaction: discord.Interaction, item: str, qty: Optional[int] = 1):
-    if interaction.guild_id is None:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    gid = interaction.guild_id
-    uid = interaction.user.id
-    qty = max(1, qty or 1)
-    p = pool()
-    async with p.acquire() as con:
-        await con.execute("UPDATE inventory SET qty = GREATEST(qty - $1, 0) WHERE guild_id=$2 AND user_id=$3 AND item=$4",
-                          qty, gid, uid, item)
-        await con.execute("DELETE FROM inventory WHERE guild_id=$1 AND user_id=$2 AND item=$3 AND qty<=0",
-                          gid, uid, item)
-    await interaction.response.send_message(f"Removed {qty}× {item}.")
-
-@bot.tree.command(description="List your inventory")
-async def inv_list(interaction: discord.Interaction):
-    if interaction.guild_id is None:
-        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    gid = interaction.guild_id
-    uid = interaction.user.id
-    p = pool()
-    async with p.acquire() as con:
-        rows = await con.fetch("SELECT item, qty FROM inventory WHERE guild_id=$1 AND user_id=$2 ORDER BY item", gid, uid)
-    text = "\n".join([f"• {r['item']}×{r['qty']}"] for r in rows)
-    text = "\n".join([f"• {r['item']}×{r['qty']}" for r in rows]) if rows else "(empty)"
-    await interaction.response.send_message("**Inventory**\n" + text, ephemeral=True)
-
-# --------------------------------- Bonuses -----------------------------------
+# --------------------------------- Bonuses/Inv/Weakness (PC) -----------------
 @bot.tree.command(description="Add a skill bonus (can be negative). These stack until removed.")
 @app_commands.describe(skill="Skill to affect", amount="Bonus (±)", reason="Why (item, effect, etc.)")
 @app_commands.choices(skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS])
@@ -667,7 +1031,49 @@ async def bonus_remove(interaction: discord.Interaction, bonus_id: int):
         await con.execute("DELETE FROM bonuses WHERE id=$1 AND guild_id=$2 AND user_id=$3", bonus_id, gid, uid)
     await interaction.response.send_message(f"Removed bonus #{bonus_id}.")
 
-# -------------------------------- Weaknesses ---------------------------------
+@bot.tree.command(description="Add item to your inventory")
+async def inv_add(interaction: discord.Interaction, item: str, qty: Optional[int] = 1):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    gid = interaction.guild_id
+    uid = interaction.user.id
+    qty = max(1, qty or 1)
+    p = pool()
+    async with p.acquire() as con:
+        await con.execute(
+            "INSERT INTO inventory (guild_id,user_id,item,qty) VALUES ($1,$2,$3,$4) "
+            "ON CONFLICT (guild_id,user_id,item) DO UPDATE SET qty = inventory.qty + EXCLUDED.qty",
+            gid, uid, item, qty
+        )
+    await interaction.response.send_message(f"Added {qty}× {item}.")
+
+@bot.tree.command(description="Remove item(s) from inventory")
+async def inv_remove(interaction: discord.Interaction, item: str, qty: Optional[int] = 1):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    gid = interaction.guild_id
+    uid = interaction.user.id
+    qty = max(1, qty or 1)
+    p = pool()
+    async with p.acquire() as con:
+        await con.execute("UPDATE inventory SET qty = GREATEST(qty - $1, 0) WHERE guild_id=$2 AND user_id=$3 AND item=$4",
+                          qty, gid, uid, item)
+        await con.execute("DELETE FROM inventory WHERE guild_id=$1 AND user_id=$2 AND item=$3 AND qty<=0",
+                          gid, uid, item)
+    await interaction.response.send_message(f"Removed {qty}× {item}.")
+
+@bot.tree.command(description="List your inventory")
+async def inv_list(interaction: discord.Interaction):
+    if interaction.guild_id is None:
+        return await interaction.response.send_message("Use this in a server.", ephemeral=True)
+    gid = interaction.guild_id
+    uid = interaction.user.id
+    p = pool()
+    async with p.acquire() as con:
+        rows = await con.fetch("SELECT item, qty FROM inventory WHERE guild_id=$1 AND user_id=$2 ORDER BY item", gid, uid)
+    text = "\n".join([f"• {r['item']}×{r['qty']}" for r in rows]) if rows else "(empty)"
+    await interaction.response.send_message("**Inventory**\n" + text, ephemeral=True)
+
 @bot.tree.command(description="Add a weakness (max two stored)")
 async def weakness_add(interaction: discord.Interaction, text: str):
     if interaction.guild_id is None:
@@ -695,7 +1101,6 @@ async def weakness_list(interaction: discord.Interaction):
         rows = await con.fetch("SELECT id, text FROM weaknesses WHERE guild_id=$1 AND user_id=$2", gid, uid)
     if not rows:
         return await interaction.response.send_message("(none)", ephemeral=True)
-    await interaction.response.send_message("\n".join([f"#{r['id']}: {r['text']}"] for r in rows))
     await interaction.response.send_message("\n".join([f"#{r['id']}: {r['text']}" for r in rows]), ephemeral=True)
 
 @bot.tree.command(description="Remove a weakness by id")
@@ -709,7 +1114,7 @@ async def weakness_remove(interaction: discord.Interaction, weakness_id: int):
         await con.execute("DELETE FROM weaknesses WHERE id=$1 AND guild_id=$2 AND user_id=$3", weakness_id, gid, uid)
     await interaction.response.send_message("Weakness removed.")
 
-# ---------------------------- Lineage Abilities ------------------------------
+# ---------------------------- Lineage Abilities (PC) -------------------------
 @bot.tree.command(description="(Whitelighter) Orbing once per scene (RP helper)")
 async def orbing(interaction: discord.Interaction, note: Optional[str] = None):
     if interaction.guild_id is None:
@@ -754,6 +1159,7 @@ async def healing(interaction: discord.Interaction, target: discord.Member, reso
         )
         if used:
             return await interaction.response.send_message("Healing already used this rest. Use /rest scope:rest.", ephemeral=True)
+        # ensure target PC exists (if they haven't made a sheet yet, this will create a stub)
         await ensure_player(gid, target.id, target.display_name)
         if resource.value == "hp":
             await con.execute("UPDATE players SET hp=LEAST(max_hp, hp+3) WHERE guild_id=$1 AND user_id=$2", gid, target.id)
@@ -790,14 +1196,14 @@ async def rest(interaction: discord.Interaction, scope: app_commands.Choice[str]
                 msg += " RV fully restored."
     await interaction.response.send_message(msg)
 
-# ------------------------------ GM advancement -------------------------------
+# ------------------------------ GM advancement (PC) --------------------------
 @bot.tree.command(description="[GM] Adjust a player's skill (caps at +5)")
 @app_commands.describe(member="Who", skill="Which skill", amount="How many points (±)")
 @app_commands.choices(skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS])
 async def gm_skill(interaction: discord.Interaction, member: discord.Member, skill: app_commands.Choice[str], amount: int):
     if interaction.guild_id is None:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
-    if not isinstance(interaction.user, discord.Member) or not is_gm(interaction.user):
+    if not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or interaction.user.guild_permissions.administrator):
         return await interaction.response.send_message("GM only.", ephemeral=True)
     gid = interaction.guild_id
     await ensure_player(gid, member.id, member.display_name)
@@ -813,140 +1219,6 @@ async def gm_skill(interaction: discord.Interaction, member: discord.Member, ski
         )
     await interaction.response.send_message(f"{member.display_name}'s {skill.name} is now +{newv}.")
 
-# ---------------------------- Avrae-style !r command -------------------------
-def _pick_skill_token(tokens: List[str]) -> Optional[str]:
-    # return the first token that matches a skill (case-insensitive); allow partials (>=3 chars)
-    low = [t.lower() for t in tokens]
-    for s in SKILLS:
-        if s in low:
-            return s
-    for s in SKILLS:
-        for t in low:
-            if len(t) >= 3 and s.startswith(t):
-                return s
-    return None
-
-@bot.command(name="r", aliases=["roll"])
-async def r_prefix(ctx: commands.Context, *, text: str = ""):
-    """
-    Examples:
-      !r 1d20 streetwise
-      !r 1d20 adv
-      !r 1d20 stealth dis vs 16 slipping past guards
-      !r 1d20 vs 13
-    """
-    if ctx.guild is None:
-        return await ctx.reply("Use this in a server.")
-
-    tokens = text.split()
-    if not tokens:
-        return await ctx.reply("Try: `!r 1d20 stealth` or `!r 1d20 dis vs 15`")
-
-    # dice (expect something like 1d20)
-    d_expr = tokens[0].lower()
-    if "d" not in d_expr:
-        return await ctx.reply("First token should be a dice expression like `1d20`.")
-    try:
-        dice_n, dice_sides = d_expr.split("d", 1)
-        dice_n = int(dice_n or "1")
-        dice_sides = int(dice_sides)
-    except Exception:
-        return await ctx.reply("Couldn’t parse dice. Use `1d20`.")
-    tokens = tokens[1:]
-
-    # adv/dis flags
-    advantage = any(t.lower() in ("adv", "advantage") for t in tokens)
-    disadvantage = any(t.lower() in ("dis", "disadvantage") for t in tokens)
-    if advantage and disadvantage:
-        return await ctx.reply("Can't have both advantage and disadvantage.")
-
-    # DC: "vs 15" or "dc 15"
-    dc = None
-    for i, t in enumerate(tokens):
-        if t.lower() in ("vs", "dc") and i + 1 < len(tokens):
-            try:
-                dc = int(tokens[i + 1])
-                tokens = tokens[:i] + tokens[i + 2:]
-                break
-            except Exception:
-                pass
-
-    # pick a skill if mentioned (supports partials like "street")
-    skill = _pick_skill_token(tokens)
-    if skill:
-        # strip the skill token from the note
-        for i, tok in enumerate(list(tokens)):
-            if tok.lower() == skill or (len(tok) >= 3 and skill.startswith(tok.lower())):
-                tokens.pop(i)
-                break
-
-    # remaining text is note
-    note = " ".join(tokens).strip() or None
-
-    # ensure player & fetch bonus
-    gid = ctx.guild.id
-    uid = ctx.author.id
-    await ensure_player(gid, uid, ctx.author.display_name)
-
-    base = extra = total_skill = 0
-    skill_name = None
-    if skill:
-        base, extra, total_skill = await get_skill_total(gid, uid, skill)
-        skill_name = skill.title()
-
-    # roll
-    if dice_n < 1 or dice_sides < 1:
-        return await ctx.reply("Dice must be positive.")
-
-    if dice_sides == 20 and dice_n == 1 and (advantage or disadvantage):
-        d1, d2 = random.randint(1, 20), random.randint(1, 20)
-        d20 = max(d1, d2) if advantage else min(d1, d2)
-        advtxt = f"Advantage ({d1}/{d2})" if advantage else f"Disadvantage ({d1}/{d2})"
-        dice_total = d20
-    else:
-        rolls = [random.randint(1, dice_sides) for _ in range(min(dice_n, 50))]
-        dice_total = sum(rolls)
-        advtxt = None
-
-    total = dice_total + total_skill
-
-    # embed
-    title = f"{ctx.author.display_name} rolls {d_expr}"
-    if skill_name:
-        title += f" • {skill_name}"
-
-    embed = discord.Embed(title=title, color=discord.Color.blurple())
-    if dice_sides == 20 and dice_n == 1:
-        nat = " (CRIT!)" if dice_total == 20 else (" (BOTCH)" if dice_total == 1 else "")
-        embed.add_field(name="d20", value=f"{dice_total}{nat}")
-    else:
-        embed.add_field(name="Dice", value=str(dice_total))
-
-    if skill_name:
-        embed.add_field(name="Skill base", value=f"+{base}")
-        if extra:
-            embed.add_field(name="Bonuses", value=f"+{extra}")
-
-    embed.add_field(name="Total", value=f"**{EMOJI_STAR}{total}{EMOJI_STAR}**", inline=False)
-
-    if dc is not None:
-        outcome = "✅ Success" if (dice_total == 20 or total >= dc) else "❌ Failure"
-        if dice_sides == 20 and dice_n == 1 and dice_total == 1:
-            outcome = "❌ **Nat 1** (Complication)"
-        elif dice_sides == 20 and dice_n == 1 and dice_total == 20:
-            outcome = "✅ **Nat 20** (Automatic)"
-        embed.add_field(name=f"vs DC {dc}", value=outcome, inline=False)
-
-    footer_parts = []
-    if advtxt:
-        footer_parts.append(advtxt)
-    if note:
-        footer_parts.append(note)
-    if footer_parts:
-        embed.set_footer(text=" • ".join(footer_parts))
-
-    await ctx.reply(embed=embed)
-
 # ---------------------------------- RUN --------------------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
@@ -955,3 +1227,4 @@ if not TOKEN:
 if __name__ == "__main__":
     start_keep_alive()  # keep Render free plan happy
     bot.run(TOKEN)
+
