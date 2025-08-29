@@ -4,27 +4,17 @@
 ENV (Render -> your service -> Environment):
 - DISCORD_TOKEN = <your Discord bot token>
 - DATABASE_URL  = postgresql://USER:PASSWORD@HOST:PORT/DB?sslmode=require
+- GUILD_ID      = <optional server id for instant slash sync>
 
 Start command on Render: python bot.py
 Build command:          pip install -r requirements.txt
-
-This file contains:
-- Keep-alive Flask web server (so Render's free Web Service sees a bound $PORT)
-- Postgres schema + asyncpg pool
-- Slash commands for your custom system:
-  /create, /sheet, /roll, /oppose, /hp, /rv, /favor,
-  /inv_add, /inv_remove, /inv_list,
-  /bonus_add, /bonus_list, /bonus_remove,
-  /weakness_add, /weakness_list, /weakness_remove,
-  /career_set (Humans), lineage abilities: /orbing, /healing, /rest,
-  GM: /gm_skill
 """
 
 # ------------------------- keep-alive (in this file) -------------------------
 from flask import Flask
 from threading import Thread
-import os, random, json, io
-from typing import Dict, Optional, List, Tuple
+import os, random
+from typing import Optional, List, Tuple
 
 app = Flask(__name__)
 
@@ -34,7 +24,6 @@ def home():
 
 def _run_keepalive():
     port = int(os.environ.get("PORT", "10000"))
-    # host 0.0.0.0 so Render can hit it
     app.run(host="0.0.0.0", port=port)
 
 def start_keep_alive():
@@ -47,9 +36,10 @@ from discord import app_commands
 import asyncpg
 
 BOT_NAME = "665"
-EMOJI_STAR = "✨️"  # show totals as **✨️<n>✨️**
+EMOJI_STAR = "✨️"  # totals show as **✨️<n>✨️**
+GUILD_ID = int(os.getenv("GUILD_ID", "0") or 0)  # optional: for fast slash sync
 
-# Skills (exactly the 10 you defined)
+# Skills (your 10)
 SKILLS = [
     "investigate", "persuade", "insight", "athletics", "stealth",
     "combat", "occult", "streetwise", "tech", "willpower",
@@ -163,21 +153,32 @@ async def get_pool_url() -> str:
 # ------------------------------- Bot class -----------------------------------
 class TTRPGBot(commands.Bot):
     def __init__(self):
-        super().__init__(command_prefix="!", intents=discord.Intents.default())
+        intents = discord.Intents.default()
+        intents.message_content = True  # needed for !r prefix command
+        super().__init__(command_prefix="!", intents=intents)
         self.pool: Optional[asyncpg.Pool] = None
 
     async def setup_hook(self):
         db_url = await get_pool_url()
         self.pool = await asyncpg.create_pool(db_url, min_size=1, max_size=5)
         await init_db(self.pool)
-        await self.tree.sync()
+
+        # Fast guild sync if GUILD_ID provided
+        if GUILD_ID:
+            guild = discord.Object(id=GUILD_ID)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            print(f"[665] Synced {len(synced)} commands to guild {GUILD_ID}")
+        else:
+            synced = await self.tree.sync()
+            print(f"[665] Synced {len(synced)} global commands")
 
 bot = TTRPGBot()
 
 @bot.event
 async def on_ready():
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.playing, name="/sheet • /roll")
+        activity=discord.Activity(type=discord.ActivityType.playing, name="/sheet • /roll • !r")
     )
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
@@ -205,15 +206,13 @@ async def get_skill_total(gid: int, uid: int, skill: str) -> Tuple[int, int, int
     s = slug(skill)
     p = pool()
     async with p.acquire() as con:
-        base = await con.fetchval(
+        base = int(await con.fetchval(
             "SELECT points FROM skills WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, s
-        )
-        base = int(base or 0)
-        bonus = await con.fetchval(
+        ) or 0)
+        bonus = int(await con.fetchval(
             "SELECT COALESCE(SUM(bonus),0) FROM bonuses WHERE guild_id=$1 AND user_id=$2 AND skill=$3",
             gid, uid, s
-        )
-        bonus = int(bonus or 0)
+        ) or 0)
     return base, bonus, base + bonus
 
 def is_gm(member: discord.Member) -> bool:
@@ -301,7 +300,7 @@ async def create(
     if quote:
         embed.add_field(name="Quote", value=f"“{quote}”", inline=False)
     embed.add_field(name="Starts with", value="HP 10, RV 5 (Whitelighter +2), Favors 1", inline=False)
-    embed.set_footer(text="Use /sheet to view, /roll to play.")
+    embed.set_footer(text="Use /sheet to view, /roll or !r to play.")
     await interaction.response.send_message(embed=embed)
 
 # ------------------------------- Career (Human) -------------------------------
@@ -573,7 +572,8 @@ async def inv_list(interaction: discord.Interaction):
     p = pool()
     async with p.acquire() as con:
         rows = await con.fetch("SELECT item, qty FROM inventory WHERE guild_id=$1 AND user_id=$2 ORDER BY item", gid, uid)
-    text = "\n".join([f"• {r['item']}×{r['qty']}" for r in rows]) or "(empty)"
+    text = "\n".join([f"• {r['item']}×{r['qty']}"] for r in rows)
+    text = "\n".join([f"• {r['item']}×{r['qty']}" for r in rows]) if rows else "(empty)"
     await interaction.response.send_message("**Inventory**\n" + text, ephemeral=True)
 
 # --------------------------------- Bonuses -----------------------------------
@@ -647,6 +647,7 @@ async def weakness_list(interaction: discord.Interaction):
         rows = await con.fetch("SELECT id, text FROM weaknesses WHERE guild_id=$1 AND user_id=$2", gid, uid)
     if not rows:
         return await interaction.response.send_message("(none)", ephemeral=True)
+    await interaction.response.send_message("\n".join([f"#{r['id']}: {r['text']}"] for r in rows))
     await interaction.response.send_message("\n".join([f"#{r['id']}: {r['text']}" for r in rows]), ephemeral=True)
 
 @bot.tree.command(description="Remove a weakness by id")
@@ -764,12 +765,145 @@ async def gm_skill(interaction: discord.Interaction, member: discord.Member, ski
         )
     await interaction.response.send_message(f"{member.display_name}'s {skill.name} is now +{newv}.")
 
+# ---------------------------- Avrae-style !r command -------------------------
+def _pick_skill_token(tokens: List[str]) -> Optional[str]:
+    # return the first token that matches a skill (case-insensitive); allow partials (>=3 chars)
+    low = [t.lower() for t in tokens]
+    for s in SKILLS:
+        if s in low:
+            return s
+    for s in SKILLS:
+        for t in low:
+            if len(t) >= 3 and s.startswith(t):
+                return s
+    return None
+
+@bot.command(name="r", aliases=["roll"])
+async def r_prefix(ctx: commands.Context, *, text: str = ""):
+    """
+    Examples:
+      !r 1d20 streetwise
+      !r 1d20 adv
+      !r 1d20 stealth dis vs 16 slipping past guards
+      !r 1d20 vs 13
+    """
+    if ctx.guild is None:
+        return await ctx.reply("Use this in a server.")
+
+    tokens = text.split()
+    if not tokens:
+        return await ctx.reply("Try: `!r 1d20 stealth` or `!r 1d20 dis vs 15`")
+
+    # dice (expect something like 1d20)
+    d_expr = tokens[0].lower()
+    if "d" not in d_expr:
+        return await ctx.reply("First token should be a dice expression like `1d20`.")
+    try:
+        dice_n, dice_sides = d_expr.split("d", 1)
+        dice_n = int(dice_n or "1")
+        dice_sides = int(dice_sides)
+    except Exception:
+        return await ctx.reply("Couldn’t parse dice. Use `1d20`.")
+    tokens = tokens[1:]
+
+    # adv/dis flags
+    advantage = any(t.lower() in ("adv", "advantage") for t in tokens)
+    disadvantage = any(t.lower() in ("dis", "disadvantage") for t in tokens)
+    if advantage and disadvantage:
+        return await ctx.reply("Can't have both advantage and disadvantage.")
+
+    # DC: "vs 15" or "dc 15"
+    dc = None
+    for i, t in enumerate(tokens):
+        if t.lower() in ("vs", "dc") and i + 1 < len(tokens):
+            try:
+                dc = int(tokens[i + 1])
+                tokens = tokens[:i] + tokens[i + 2:]
+                break
+            except Exception:
+                pass
+
+    # pick a skill if mentioned (supports partials like "street")
+    skill = _pick_skill_token(tokens)
+    if skill:
+        # strip the skill token from the note
+        for i, tok in enumerate(list(tokens)):
+            if tok.lower() == skill or (len(tok) >= 3 and skill.startswith(tok.lower())):
+                tokens.pop(i)
+                break
+
+    # remaining text is note
+    note = " ".join(tokens).strip() or None
+
+    # ensure player & fetch bonus
+    gid = ctx.guild.id
+    uid = ctx.author.id
+    await ensure_player(gid, uid, ctx.author.display_name)
+
+    base = extra = total_skill = 0
+    skill_name = None
+    if skill:
+        base, extra, total_skill = await get_skill_total(gid, uid, skill)
+        skill_name = skill.title()
+
+    # roll
+    if dice_n < 1 or dice_sides < 1:
+        return await ctx.reply("Dice must be positive.")
+
+    if dice_sides == 20 and dice_n == 1 and (advantage or disadvantage):
+        d1, d2 = random.randint(1, 20), random.randint(1, 20)
+        d20 = max(d1, d2) if advantage else min(d1, d2)
+        advtxt = f"Advantage ({d1}/{d2})" if advantage else f"Disadvantage ({d1}/{d2})"
+        dice_total = d20
+    else:
+        rolls = [random.randint(1, dice_sides) for _ in range(min(dice_n, 50))]
+        dice_total = sum(rolls)
+        advtxt = None
+
+    total = dice_total + total_skill
+
+    # embed
+    title = f"{ctx.author.display_name} rolls {d_expr}"
+    if skill_name:
+        title += f" • {skill_name}"
+
+    embed = discord.Embed(title=title, color=discord.Color.blurple())
+    if dice_sides == 20 and dice_n == 1:
+        nat = " (CRIT!)" if dice_total == 20 else (" (BOTCH)" if dice_total == 1 else "")
+        embed.add_field(name="d20", value=f"{dice_total}{nat}")
+    else:
+        embed.add_field(name="Dice", value=str(dice_total))
+
+    if skill_name:
+        embed.add_field(name="Skill base", value=f"+{base}")
+        if extra:
+            embed.add_field(name="Bonuses", value=f"+{extra}")
+
+    embed.add_field(name="Total", value=f"**{EMOJI_STAR}{total}{EMOJI_STAR}**", inline=False)
+
+    if dc is not None:
+        outcome = "✅ Success" if (dice_total == 20 or total >= dc) else "❌ Failure"
+        if dice_sides == 20 and dice_n == 1 and dice_total == 1:
+            outcome = "❌ **Nat 1** (Complication)"
+        elif dice_sides == 20 and dice_n == 1 and dice_total == 20:
+            outcome = "✅ **Nat 20** (Automatic)"
+        embed.add_field(name=f"vs DC {dc}", value=outcome, inline=False)
+
+    footer_parts = []
+    if advtxt:
+        footer_parts.append(advtxt)
+    if note:
+        footer_parts.append(note)
+    if footer_parts:
+        embed.set_footer(text=" • ".join(footer_parts))
+
+    await ctx.reply(embed=embed)
+
 # ---------------------------------- RUN --------------------------------------
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN in the environment.")
 
 if __name__ == "__main__":
-    # Keep-alive web server for Render free plan
-    start_keep_alive()
+    start_keep_alive()  # keep Render free plan happy
     bot.run(TOKEN)
