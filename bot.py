@@ -219,7 +219,7 @@ def is_gm(member: discord.Member) -> bool:
     p = member.guild_permissions
     return p.administrator or p.manage_guild
 
-# --------------------------- Character Creation ------------------------------
+# --------------------------- Character Creation (fixed) -----------------------
 @bot.tree.command(description="Create your character with lineage and skill distribution")
 @app_commands.describe(
     name="Character name",
@@ -230,6 +230,8 @@ def is_gm(member: discord.Member) -> bool:
     plus2_b="Second +2 skill",
     plus1_a="First +1 skill",
     plus1_b="Second +1 skill",
+    human_bonus_skill="(HUMAN) +1 to any one of your chosen skills",
+    witch_bonus_skill="(WITCH) +2 to any one of your chosen skills",
 )
 @app_commands.choices(
     lineage=[app_commands.Choice(name=x.capitalize(), value=x) for x in LINEAGES],
@@ -238,6 +240,8 @@ def is_gm(member: discord.Member) -> bool:
     plus2_b=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
     plus1_a=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
     plus1_b=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    human_bonus_skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
+    witch_bonus_skill=[app_commands.Choice(name=s.title(), value=s) for s in SKILLS],
 )
 async def create(
     interaction: discord.Interaction,
@@ -249,22 +253,34 @@ async def create(
     plus2_b: Optional[app_commands.Choice[str]] = None,
     plus1_a: Optional[app_commands.Choice[str]] = None,
     plus1_b: Optional[app_commands.Choice[str]] = None,
+    human_bonus_skill: Optional[app_commands.Choice[str]] = None,
+    witch_bonus_skill: Optional[app_commands.Choice[str]] = None,
 ):
     if interaction.guild_id is None:
         return await interaction.response.send_message("Use this in a server.", ephemeral=True)
     gid = interaction.guild_id
     uid = interaction.user.id
 
+    # Validate the 5 distinct skill picks
     picks = [x.value for x in [plus3, plus2_a, plus2_b, plus1_a, plus1_b] if x]
     if len(picks) != 5 or len(set(picks)) != 5:
         return await interaction.response.send_message(
             "Pick **five different** skills: one +3, two +2, and two +1.", ephemeral=True
         )
+    picked_set = set(picks)
 
     await ensure_player(gid, uid, name=name, lineage=lineage.value)
     p = pool()
     async with p.acquire() as con:
-        # reset skills then apply distribution
+        # 1) Hard reset to BASELINE so old lineage perks don’t stick
+        await con.execute("""
+            UPDATE players
+            SET hp=10, max_hp=10, rv=5, max_rv=5, favors=1, connections=0
+            WHERE guild_id=$1 AND user_id=$2
+        """, gid, uid)
+        await con.execute("DELETE FROM ability_usage WHERE guild_id=$1 AND user_id=$2", gid, uid)
+
+        # 2) Reset skills then apply the chosen distribution
         await con.execute("UPDATE skills SET points=0 WHERE guild_id=$1 AND user_id=$2", gid, uid)
         await con.execute(
             "UPDATE skills SET points=3 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, plus3.value
@@ -274,34 +290,66 @@ async def create(
         for s in [plus1_a.value, plus1_b.value]:
             await con.execute("UPDATE skills SET points=1 WHERE guild_id=$1 AND user_id=$2 AND skill=$3", gid, uid, s)
 
-        # lineage effects
+        # 3) Apply lineage-specific perks
+        start_text = "HP 10, RV 5, Favors 1"
+
         if lineage.value == "whitelighter":
+            # +2 RV (both current & max), and track orbing/healing usage
             await con.execute("UPDATE players SET rv=rv+2, max_rv=max_rv+2 WHERE guild_id=$1 AND user_id=$2", gid, uid)
             await con.execute(
-                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'orbing','scene',FALSE)"
-                " ON CONFLICT DO NOTHING",
+                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'orbing','scene',FALSE) "
+                "ON CONFLICT DO NOTHING",
                 gid, uid
             )
             await con.execute(
-                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'healing','rest',FALSE)"
-                " ON CONFLICT DO NOTHING",
+                "INSERT INTO ability_usage (guild_id,user_id,ability,scope,used) VALUES ($1,$2,'healing','rest',FALSE) "
+                "ON CONFLICT DO NOTHING",
                 gid, uid
             )
-        elif lineage.value == "human":
-            await con.execute("UPDATE players SET connections=connections+3 WHERE guild_id=$1 AND user_id=$2", gid, uid)
+            start_text += " (+2 RV from Whitelighter)"
 
+        elif lineage.value == "human":
+            # +3 connections, and +1 to ANY ONE of the chosen skills (cap 5)
+            await con.execute("UPDATE players SET connections=connections+3 WHERE guild_id=$1 AND user_id=$2", gid, uid)
+            applied = None
+            if human_bonus_skill and human_bonus_skill.value in picked_set:
+                await con.execute(
+                    "UPDATE skills SET points=LEAST(points+1,5) WHERE guild_id=$1 AND user_id=$2 AND skill=$3",
+                    gid, uid, human_bonus_skill.value
+                )
+                applied = human_bonus_skill.value
+                start_text += f" (+3 connections; +1 to {applied.title()})"
+            else:
+                start_text += " (+3 connections)"
+
+        elif lineage.value == "witch":
+            # +2 to ANY ONE of the chosen skills (cap 5)
+            applied = None
+            if witch_bonus_skill and witch_bonus_skill.value in picked_set:
+                await con.execute(
+                    "UPDATE skills SET points=LEAST(points+2,5) WHERE guild_id=$1 AND user_id=$2 AND skill=$3",
+                    gid, uid, witch_bonus_skill.value
+                )
+                applied = witch_bonus_skill.value
+                start_text += f" (+2 to {applied.title()})"
+
+        # Demon: Glamour is RP utility (no numeric change here)
+
+        # 4) Save top-level character fields
         await con.execute(
             "UPDATE players SET name=$1, quote=$2, lineage=$3 WHERE guild_id=$4 AND user_id=$5",
             name, quote, lineage.value, gid, uid
         )
 
+    # 5) Friendly confirmation embed
     embed = discord.Embed(title=f"{name} created!", color=discord.Color.magenta())
     embed.add_field(name="Lineage", value=lineage.name)
     if quote:
         embed.add_field(name="Quote", value=f"“{quote}”", inline=False)
-    embed.add_field(name="Starts with", value="HP 10, RV 5 (Whitelighter +2), Favors 1", inline=False)
+    embed.add_field(name="Starts with", value=start_text, inline=False)
     embed.set_footer(text="Use /sheet to view, /roll or !r to play.")
     await interaction.response.send_message(embed=embed)
+
 
 # ------------------------------- Career (Human) -------------------------------
 @bot.tree.command(description="(Human) Set your Career: Home, Transportation, Wealth (+ optional gear note)")
