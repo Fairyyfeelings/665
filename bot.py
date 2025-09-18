@@ -1219,10 +1219,8 @@ async def gm_skill(interaction: discord.Interaction, member: discord.Member, ski
         )
     await interaction.response.send_message(f"{member.display_name}'s {skill.name} is now +{newv}.")
 
-# --- Pregnancy Check Command -----------------------------------------------
-import random
-from discord import app_commands
-from discord import Interaction
+# --- Pregnancy Check Command -------------------------------------------------
+# (uses existing: random, discord, app_commands)
 
 def d20():
     return random.randint(1, 20)
@@ -1230,10 +1228,7 @@ def d20():
 def d100():
     return random.randint(1, 100)
 
-# If you already have a `tree = app_commands.CommandTree(bot)` or similar, reuse it.
-# Replace `tree` below with your actual CommandTree variable if different.
-
-@tree.command(name="pregnancy", description="Resolve a pregnancy check with optional pull-out/protection and twins.")
+@bot.tree.command(name="pregnancy", description="Resolve a pregnancy check with optional pull-out/protection and twins.")
 @app_commands.describe(
     dc="DC for each partner's d20 check (default 10).",
     impregnator_bonus="Bonus to the impregnator's d20 (default 0).",
@@ -1252,11 +1247,11 @@ def d100():
     protection=[
         app_commands.Choice(name="none", value="none"),
         app_commands.Choice(name="condom", value="condom"),
-        app_commands.Choice(name="spell", value="spell"),  # magical ward, etc.
+        app_commands.Choice(name="spell", value="spell"),
     ]
 )
 async def pregnancy(
-    itx: Interaction,
+    interaction: discord.Interaction,
     dc: int = 10,
     impregnator_bonus: int = 0,
     partner_bonus: int = 0,
@@ -1271,12 +1266,10 @@ async def pregnancy(
     twin_mod: int = 0,
 ):
     """
-    Flow:
-    1) Opposed-style: both roll d20 vs DC. If either fails -> not pregnant.
-    2) If both succeed: compute final conception % with pull-out/protection gates.
-    3) Roll d100 vs final % for pregnancy. If pregnant, roll twins.
+    1) Both roll d20 vs DC. If either fails -> not pregnant.
+    2) If both pass, apply pull-out/protection gates to a base % chance.
+    3) Roll d100 vs final %; if pregnant, roll for twins.
     """
-
     # 1) d20 checks
     him = d20()
     her = d20()
@@ -1284,7 +1277,6 @@ async def pregnancy(
     her_total = her + partner_bonus
     both_pass = (him_total >= dc) and (her_total >= dc)
 
-    # Early message scaffolding
     lines = []
     lines.append("**Pregnancy Check**")
     lines.append(f"• DC: **{dc}**")
@@ -1292,14 +1284,13 @@ async def pregnancy(
     lines.append(f"• Partner roll: d20 (**{her}**) + {partner_bonus} = **{her_total}** → {'✅ success' if her_total >= dc else '❌ fail'}")
 
     if not both_pass:
-        await itx.response.send_message("\n".join(lines) + "\n\n**Result:** Not pregnant (one or both checks failed).")
+        await interaction.response.send_message("\n".join(lines) + "\n\n**Result:** Not pregnant (one or both checks failed).")
         return
 
-    # 2) Compute modified conception chance
+    # 2) modified conception chance
     final_pct = float(base_chance)
     notes = [f"Base: {base_chance}%"]
 
-    # Pull-out logic
     if pull_out:
         po_roll = d100()
         lines.append(f"• Pull-out attempt: d100 (**{po_roll}**) ≤ {pullout_fail_pct}% means **failed pull-out**")
@@ -1309,7 +1300,6 @@ async def pregnancy(
             notes.append(f"Pull-out succeeded: applying residual {pullout_residual_pct}% of current")
             final_pct *= (pullout_residual_pct / 100.0)
 
-    # Protection logic
     protection_val = protection.value if protection else "none"
     if protection_val == "condom":
         prot_roll = d100()
@@ -1319,10 +1309,8 @@ async def pregnancy(
         else:
             notes.append(f"Condom intact: applying residual {protection_residual_pct}% of current")
             final_pct *= (protection_residual_pct / 100.0)
-
     elif protection_val == "spell":
-        # You can tune a ward however you like; here we use a tiny 1% fail and 1% residual by default
-        ward_fail_pct = min(5, condom_fail_pct)  # small fail chance
+        ward_fail_pct = min(5, condom_fail_pct)  # tiny fail chance
         prot_roll = d100()
         lines.append(f"• Ward check: d100 (**{prot_roll}**) ≤ {ward_fail_pct}% → **ward fails**")
         if prot_roll <= ward_fail_pct:
@@ -1331,26 +1319,23 @@ async def pregnancy(
             notes.append(f"Ward holds: applying residual {protection_residual_pct}% of current")
             final_pct *= (protection_residual_pct / 100.0)
 
-    # Clamp and roll
-    if final_pct < 0: final_pct = 0.0
-    if final_pct > 100: final_pct = 100.0
+    final_pct = max(0.0, min(100.0, final_pct))
 
-    # 3) Conception roll
+    # 3) conception + twins
     conceive_roll = d100()
     conceived = conceive_roll <= final_pct
-
     lines.append(f"• Final conception chance: **{final_pct:.2f}%** ({', '.join(notes)})")
     lines.append(f"• Conception roll: d100 (**{conceive_roll}**) → {'**PREGNANT** ✅' if conceived else '**Not pregnant** ❌'}")
 
-    # Twins if pregnant
     if conceived:
         twin_threshold = max(0, min(100, twin_chance_pct + twin_mod))
         t_roll = d100()
         is_twins = t_roll <= twin_threshold
         lines.append(f"• Twins check: d100 (**{t_roll}**) ≤ {twin_threshold}% → {'**TWINS** 👶👶' if is_twins else 'single pregnancy'}")
 
-    await itx.response.send_message("\n".join(lines))
+    await interaction.response.send_message("\n".join(lines))
 # --- End Pregnancy Command ---------------------------------------------------
+
 
 
 # ---------------------------------- RUN --------------------------------------
